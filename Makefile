@@ -1,5 +1,5 @@
 CFLAGS = -Wall -Wextra -O2
-LDFLAGS = -lcurl
+LDFLAGS = -lpthread -lcurl
 
 SRC = $(wildcard *.c)
 OBJ = $(SRC:.c=.o)

@@ -89,14 +89,14 @@ void on_interaction(struct discord *client, const struct discord_interaction *ev
 		char *buf = malloc(bufsize);
 		do {
 			waitpid(pid, &status, WNOHANG);
-			if (bufsize == bytes_written) {
+			if (bufsize == bytes_written - 1) {
 				char *new_buf = realloc(buf, bufsize * 2);
 				if (new_buf) {
 					buf = new_buf;
 					bufsize *= 2;
 				}
 			}
-			bytes_written += fread(buf + bytes_written, 1, bufsize - bytes_written, fp);
+			bytes_written += fread(buf + bytes_written, 1, bufsize - bytes_written - 1, fp);
 		} while (!WIFEXITED(status) && !WIFSIGNALED(status));
 		buf[bytes_written] = '\0';
 		fclose(fp);
