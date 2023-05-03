@@ -1,35 +1,13 @@
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <unistd.h>
-
-#include <sys/wait.h>
+#include <time.h>
 
 #include <concord/discord.h>
 #include <concord/log.h>
 
-static pid_t run_command(const char *cmd, FILE **fp) {
-	int shpipe[2];
-	if (pipe(shpipe) == -1) {
-		log_error("Failed to open pipe.");
-		return -1;
-	}
-
-	pid_t shpid = fork();
-	if (shpid == -1) {
-		log_error("Failed to fork process for sh");
-		return -1;
-	} else if (shpid) {
-		close(shpipe[1]);
-		*fp = fdopen(shpipe[0], "r");
-		return shpid;
-	} else {
-		dup2(shpipe[1], STDOUT_FILENO);
-		close(shpipe[0]);
-		execl("/bin/sh", "sh", "-c", cmd, NULL);
-	}
-}
+#include "job.h"
 
 // Function pointer type for commands
 typedef void (*command_func)(struct discord *, const struct discord_interaction *);
@@ -47,64 +25,48 @@ struct bot_command {
 
 static void bot_command_run(struct discord *client, const struct discord_interaction *event) {
 	char *cmd = event->data->options->array[0].value;
-	//struct discord_embed embed = { .title = cmd };
 	char msg[DISCORD_MAX_MESSAGE_LEN];
-	snprintf(msg, sizeof(msg), "Results of `%s`", cmd);
-	char path[DISCORD_MAX_MESSAGE_LEN];
-	snprintf(path, sizeof(path), "attachment://%s.ansi", cmd);
 
-	FILE *fp;
-	pid_t pid = run_command(cmd, &fp);
-	if (pid == -1) {
-		snprintf(msg, sizeof(msg), "Failed to run `%s`: %s", cmd, strerror(errno));
-		struct discord_interaction_response res = {
-			.type = DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE,
-			.data = &(struct discord_interaction_callback_data) {
-				.content = msg
-			}
-		};
+	job_uid_t uid = submit_job(
+		cmd, event->user ? event->user->id : event->member->user->id, event->channel_id
+	);
 
-		discord_create_interaction_response(client, event->id, event->token, &res, NULL);
-		return;
+	if (uid == -1) {
+		strncpy(msg, "There was a problem queuing your job. The queue may be full.", sizeof(msg));
+	} else {
+		snprintf(msg, sizeof(msg), "Your job has been queued!\nJob ID: `%lx`", uid);
 	}
-
-	int status;
-	size_t bufsize = 65536;
-	size_t bytes_written = 0;
-	char *buf = malloc(bufsize);
-	do {
-		waitpid(pid, &status, WNOHANG);
-		if (bufsize == bytes_written - 1) {
-			char *new_buf = realloc(buf, bufsize * 2);
-			if (new_buf) {
-				buf = new_buf;
-				bufsize *= 2;
-			}
-		}
-		bytes_written += fread(buf + bytes_written, 1, bufsize - bytes_written - 1, fp);
-	} while (!WIFEXITED(status) && !WIFSIGNALED(status));
-	buf[bytes_written] = '\0';
-	fclose(fp);
-
-	struct discord_attachment attachment = {
-		.content = buf,
-		.filename = path,
-		.content_type = "text/ansi"
-	};
 
 	struct discord_interaction_response res = {
 		.type = DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE,
 		.data = &(struct discord_interaction_callback_data) {
-			.content = msg,
-			.attachments = &(struct discord_attachments) {
-				.size = 1,
-				.array = &attachment
-			}
+			.content = msg
 		}
 	};
 
 	discord_create_interaction_response(client, event->id, event->token, &res, NULL);
-	free(buf);
+}
+
+static void bot_command_help(struct discord *client, const struct discord_interaction *event) {
+	char msg[DISCORD_MAX_MESSAGE_LEN];
+
+	// intro message
+	snprintf(
+		msg, sizeof(msg),
+		"Hello %s, Welcome to Linux Bot! This is currently a work in progress, but many features are planned!\n"
+		"You can find the source code for this bot at https://github.com/WCBROW01/linuxbot\n"
+		"Please submit any bugs or issues there, or feel free to make a pull request!",
+		event->user ? event->user->username : event->member->user->username
+	);
+
+	struct discord_interaction_response res = {
+		.type = DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE,
+		.data = &(struct discord_interaction_callback_data) {
+			.content = msg
+		}
+	};
+
+	discord_create_interaction_response(client, event->id, event->token, &res, NULL);
 }
 
 static struct bot_command commands[] = {
@@ -124,11 +86,19 @@ static struct bot_command commands[] = {
 			})
 		},
 		.func = &bot_command_run
+	},
+	{
+		.cmd = {
+			.name = "help",
+			.description = "Get help on how to use the bot!"
+		},
+		.func = &bot_command_help
 	}
 };
 
 static void on_ready(struct discord *client, const struct discord_ready *event) {
 	log_info("Logged in as %s!", event->user->username);
+	init_job_queue(client);
 
 	// create commands
 	for (struct bot_command *i = commands; i < commands + sizeof(commands) / sizeof(*commands); ++i) {
@@ -139,7 +109,7 @@ static void on_ready(struct discord *client, const struct discord_ready *event) 
 static void on_interaction(struct discord *client, const struct discord_interaction *event) {
 	if (event->type != DISCORD_INTERACTION_APPLICATION_COMMAND)
 		return; // not a slash command
-	
+
 	// invoke the command
 	for (const struct bot_command *i = commands; i < commands + sizeof(commands) / sizeof(*commands); ++i) {
 		if (!strcmp(event->data->name, i->cmd.name)) {
@@ -147,7 +117,7 @@ static void on_interaction(struct discord *client, const struct discord_interact
 			return;
 		}
 	}
-	
+
 	// not a real command
 	struct discord_interaction_response res = {
 		.type = DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE,
@@ -159,6 +129,7 @@ static void on_interaction(struct discord *client, const struct discord_interact
 }
 
 int main(void) {
+	srandom(time(NULL));
 	struct discord *client = discord_config_init("config.json");
 	discord_set_on_ready(client, &on_ready);
 	discord_set_on_interaction_create(client, &on_interaction);
