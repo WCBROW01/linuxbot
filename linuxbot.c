@@ -23,6 +23,16 @@ struct bot_command {
 #define _CREATE_OPTIONS(options) &(struct discord_application_command_options) { .size = sizeof((struct discord_application_command_option[]) options) / sizeof(struct discord_application_command_option), .array = (struct discord_application_command_option[]) options }
 #define CREATE_OPTIONS(...) _CREATE_OPTIONS(P99_PROTECT(__VA_ARGS__))
 
+#define BOT_COMMAND_NOT_IMPLEMENTED() do { \
+	struct discord_interaction_response res = { \
+		.type = DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE, \
+		.data = &(struct discord_interaction_callback_data) { \
+			.content = "This command has not been implemented yet." \
+		} \
+	}; \
+	discord_create_interaction_response(client, event->id, event->token, &res, NULL); \
+} while (0)
+
 static void bot_command_run(struct discord *client, const struct discord_interaction *event) {
 	char *cmd = event->data->options->array[0].value;
 	char msg[DISCORD_MAX_MESSAGE_LEN];
@@ -34,7 +44,7 @@ static void bot_command_run(struct discord *client, const struct discord_interac
 	if (uid == -1) {
 		strncpy(msg, "There was a problem queuing your job. The queue may be full.", sizeof(msg));
 	} else {
-		snprintf(msg, sizeof(msg), "Your job has been queued!\nJob ID: `%lx`", uid);
+		snprintf(msg, sizeof(msg), "Your job has been queued!\nJob ID: `%ld`", uid);
 	}
 
 	struct discord_interaction_response res = {
@@ -69,6 +79,12 @@ static void bot_command_help(struct discord *client, const struct discord_intera
 	discord_create_interaction_response(client, event->id, event->token, &res, NULL);
 }
 
+static void bot_command_check(struct discord *client, const struct discord_interaction *event) {
+	char *id_str = event->data->options->array[0].value;
+	job_uid_t job_id = strtol(id_str, NULL, 10);
+	check_job(client, event, job_id);
+}
+
 static struct bot_command commands[] = {
 	{
 		.cmd = {
@@ -90,9 +106,29 @@ static struct bot_command commands[] = {
 	{
 		.cmd = {
 			.name = "help",
-			.description = "Get help on how to use the bot!"
+			.description = "Get help on how to use the bot!",
+			.dm_permission = true
 		},
 		.func = &bot_command_help
+	},
+	{
+		.cmd = {
+			.name = "check",
+			.description = "Check the status of a running job.",
+			.default_permission = true,
+			.dm_permission = true,
+			.options = CREATE_OPTIONS({
+				{
+					.type = DISCORD_APPLICATION_OPTION_INTEGER,
+					.name = "id",
+					.description = "The ID of your job.",
+					.required = true,
+					.min_value = "0",
+					.max_value = "2147483647"
+				}
+			})
+		},
+		.func = &bot_command_check
 	}
 };
 
@@ -104,6 +140,8 @@ static void on_ready(struct discord *client, const struct discord_ready *event) 
 	for (struct bot_command *i = commands; i < commands + sizeof(commands) / sizeof(*commands); ++i) {
 		discord_create_global_application_command(client, event->application->id, &i->cmd, NULL);
 	}
+
+	log_info("Ready!");
 }
 
 static void on_interaction(struct discord *client, const struct discord_interaction *event) {
@@ -111,7 +149,7 @@ static void on_interaction(struct discord *client, const struct discord_interact
 		return; // not a slash command
 
 	// invoke the command
-	for (const struct bot_command *i = commands; i < commands + sizeof(commands) / sizeof(*commands); ++i) {
+	for (struct bot_command *i = commands; i < commands + sizeof(commands) / sizeof(*commands); ++i) {
 		if (!strcmp(event->data->name, i->cmd.name)) {
 			i->func(client, event);
 			return;

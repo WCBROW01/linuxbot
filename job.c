@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -14,6 +15,7 @@
 #include "job.h"
 
 enum job_status {
+	JOB_NOT_EXIST = -1,
 	JOB_WAITING,
 	JOB_RUNNING,
 	JOB_EXITED,
@@ -32,6 +34,8 @@ static const char *status_string[] = {
 struct job {
 	job_uid_t uid;
 	char *cmd;
+	char *output;
+	pthread_mutex_t output_mutex;
 	u64snowflake user_id;
 	u64snowflake channel_id;
 	atomic_int status;
@@ -81,7 +85,9 @@ static int job_queue_push(struct job *job) {
 static void job_finish(struct job *job) {
 	pthread_mutex_lock(&table_mutex);
 	job->uid = -1;
+	job->status = JOB_NOT_EXIST;
 	free(job->cmd);
+	pthread_mutex_destroy(&job->output_mutex);
 	pthread_mutex_unlock(&table_mutex);
 }
 
@@ -107,13 +113,11 @@ static pid_t run_command(const char *cmd, FILE **fp) {
 		execl("/bin/sh", "sh", "-c", cmd, NULL);
 	}
 
-	return -1; // unreachable
+	__builtin_unreachable();
 }
 
 static void execute_job(struct discord *client, struct job *job) {
 	char msg[DISCORD_MAX_MESSAGE_LEN];
-	char path[DISCORD_MAX_MESSAGE_LEN];
-	snprintf(path, sizeof(path), "attachment://%s.ansi", job->cmd);
 
 	FILE *fp;
 	pid_t pid = run_command(job->cmd, &fp);
@@ -121,9 +125,10 @@ static void execute_job(struct discord *client, struct job *job) {
 		job->status = JOB_ERROR;
 		snprintf(
 			msg, sizeof(msg),
+			"**Job %ld**\n"
 			"Hey <@%" PRIu64 ">! Your job %s.\n"
 			"Error: %s",
-			job->user_id, status_string[job->status], strerror(errno)
+			job->uid, job->user_id, status_string[job->status], strerror(errno)
 		);
 
 		job_finish(job);
@@ -142,6 +147,7 @@ static void execute_job(struct discord *client, struct job *job) {
 	}
 
 	char output[JOB_BUF_SIZE];
+	job->output = output;
 
 	{
 		int status;
@@ -153,19 +159,27 @@ static void execute_job(struct discord *client, struct job *job) {
 			if (bytes_read > JOB_BUF_SIZE - 1 - bytes_written) {
 				// make room in the buffer
 				size_t old_text_len = JOB_BUF_SIZE - 1 - bytes_read;
+				pthread_mutex_lock(&job->output_mutex);
 				memmove(output, output + bytes_read, old_text_len);
 				memcpy(output + old_text_len, buf, bytes_read);
 				bytes_written = JOB_BUF_SIZE - 1;
+				output[bytes_written] = '\0';
+				pthread_mutex_unlock(&job->output_mutex);
 			} else {
+				pthread_mutex_lock(&job->output_mutex);
 				memcpy(output + bytes_written, buf, bytes_read);
 				bytes_written += bytes_read;
+				output[bytes_written] = '\0';
+				pthread_mutex_unlock(&job->output_mutex);
 			}
 		} while (!waitpid(pid, &status, WNOHANG));
 		fclose(fp);
 
 		job->status = WIFEXITED(status) ? JOB_EXITED : JOB_TERMINATED;
-		output[bytes_written] = '\0';
 	}
+
+	char path[DISCORD_MAX_MESSAGE_LEN];
+	snprintf(path, sizeof(path), "attachment://linuxbot_job_%ld_output.ansi", job->uid);
 
 	struct discord_attachment attachment = {
 		.content = output,
@@ -175,9 +189,10 @@ static void execute_job(struct discord *client, struct job *job) {
 
 	snprintf(
 		msg, sizeof(msg),
+		"**Job %ld**\n"
 		"Hey <@%" PRIu64 ">! Your job %s.\n"
 		"Results of `%s`",
-		job->user_id, status_string[job->status], job->cmd
+		job->uid, job->user_id, status_string[job->status], job->cmd
 	);
 
 	job_finish(job);
@@ -244,10 +259,69 @@ job_uid_t submit_job(char *cmd, u64snowflake user_id, u64snowflake channel_id) {
 			.channel_id = channel_id,
 			.status = JOB_WAITING
 		};
+		pthread_mutex_init(&job_table[table_index].output_mutex, NULL);
 	}
 	pthread_mutex_unlock(&table_mutex);
 
 	if (result != -1) job_queue_push(&job_table[table_index]);
 
 	return result;
+}
+
+// I need to change how I create the output string for this to be accurate
+void check_job(struct discord *client, const struct discord_interaction *event, job_uid_t job_id) {
+	char msg[DISCORD_MAX_MESSAGE_LEN];
+
+	struct job *job = &job_table[job_id & (JOB_QUEUE_SIZE - 1)];
+	if (job->status == JOB_RUNNING) {
+		u64snowflake user_id = event->user ? event->user->id : event->member->user->id;
+		if (job->user_id == user_id) {
+			char path[DISCORD_MAX_MESSAGE_LEN];
+			snprintf(path, sizeof(path), "attachment://linuxbot_job_%ld_output.ansi", job_id);
+
+			pthread_mutex_lock(&job->output_mutex);
+			struct discord_attachment attachment = {
+				.content = job->output,
+				.filename = path,
+				.content_type = "text"
+			};
+
+			snprintf(
+				msg, sizeof(msg),
+				"**Job %ld**\n"
+				"Your job %s.\n"
+				"Command: `%s`",
+				job_id, status_string[job->status], job->cmd
+			);
+
+			struct discord_interaction_response res = {
+				.type = DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE,
+				.data = &(struct discord_interaction_callback_data) {
+					.content = msg,
+					.attachments = &(struct discord_attachments) {
+						.size = 1,
+						.array = &attachment
+					}
+				}
+			};
+			discord_create_interaction_response(client, event->id, event->token, &res, NULL);
+			pthread_mutex_unlock(&job->output_mutex);
+		} else {
+			struct discord_interaction_response res = {
+				.type = DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE,
+				.data = &(struct discord_interaction_callback_data) {
+					.content = "You are not the owner of this job."
+				}
+			};
+			discord_create_interaction_response(client, event->id, event->token, &res, NULL);
+		}
+	} else {
+		struct discord_interaction_response res = {
+			.type = DISCORD_INTERACTION_CHANNEL_MESSAGE_WITH_SOURCE,
+			.data = &(struct discord_interaction_callback_data) {
+				.content = "This job does not exist. It may have already finished."
+			}
+		};
+		discord_create_interaction_response(client, event->id, event->token, &res, NULL);
+	}
 }
